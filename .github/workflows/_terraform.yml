@@ -1,0 +1,188 @@
+# Workflow reutilizável: plan → (apply | destroy) de um ambiente.
+#
+# - O plan usa a role somente leitura (sem `environment:`).
+# - O apply roda dentro do GitHub Environment (prod exige aprovação) e assume
+#   a role de escrita; ele aplica EXATAMENTE o plan salvo pelo job anterior.
+name: _terraform
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Target environment (dev | prod)
+        type: string
+        required: true
+      action:
+        description: plan | apply | destroy
+        type: string
+        default: plan
+    outputs:
+      has_changes:
+        description: Whether the plan has pending changes
+        value: ${{ jobs.plan.outputs.has_changes }}
+      summary:
+        description: Plan summary as "+add ~change -destroy"
+        value: ${{ jobs.plan.outputs.summary }}
+
+# `shell: bash` ativa -o pipefail (o padrão do runner não ativa).
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.16.6"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  WORKDIR: envs/${{ inputs.environment }}
+  # Flags persistentes do painel (ADR-0004): <ENV>_ENABLE_NAT_GATEWAY etc.
+  TF_VAR_enable_nat_gateway: ${{ vars[format('{0}_ENABLE_NAT_GATEWAY', inputs.environment == 'prod' && 'PROD' || 'DEV')] || 'false' }}
+  TF_VAR_enable_alb: ${{ vars[format('{0}_ENABLE_ALB', inputs.environment == 'prod' && 'PROD' || 'DEV')] || 'false' }}
+  TF_VAR_instance_type: ${{ vars[format('{0}_INSTANCE_TYPE', inputs.environment == 'prod' && 'PROD' || 'DEV')] || 't3.micro' }}
+
+jobs:
+  plan:
+    name: 📋 plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      has_changes: ${{ steps.summary.outputs.has_changes }}
+      summary: "+${{ steps.summary.outputs.add }} ~${{ steps.summary.outputs.change }} -${{ steps.summary.outputs.destroy }}"
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKDIR }}
+    steps:
+      - name: Validate inputs
+        working-directory: .
+        env:
+          IN_ENV: ${{ inputs.environment }}
+          IN_ACTION: ${{ inputs.action }}
+        run: |
+          [[ "$IN_ENV" =~ ^(dev|prod)$ ]] || { echo "::error::environment inválido: $IN_ENV"; exit 1; }
+          [[ "$IN_ACTION" =~ ^(plan|apply|destroy)$ ]] || { echo "::error::action inválida: $IN_ACTION"; exit 1; }
+
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: AWS credentials (OIDC · plan role)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          role-session-name: gha-plan-${{ inputs.environment }}-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Panel flags
+        working-directory: .
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          ACTION: ${{ inputs.action }}
+        run: .github/scripts/flags-summary.sh
+
+      - name: terraform init
+        run: terraform init -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: terraform plan
+        id: plan
+        run: |
+          args=(-detailed-exitcode -lock-timeout=5m -no-color -out=tfplan)
+          [[ "${{ inputs.action }}" == "destroy" ]] && args+=(-destroy)
+
+          set +e
+          terraform plan "${args[@]}"
+          exit_code=$?
+          set -e
+
+          # 0 = sem mudanças · 1 = erro · 2 = há mudanças
+          [[ $exit_code -eq 1 ]] && exit 1
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+          terraform show -no-color tfplan > plan.txt
+
+      - name: Plan summary
+        id: summary
+        run: ../../.github/scripts/plan-summary.sh "${{ inputs.environment }}" "${{ inputs.action }}" "${{ steps.plan.outputs.exit_code }}"
+
+      - name: Upload plan
+        uses: actions/upload-artifact@v7
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: |
+            ${{ env.WORKDIR }}/tfplan
+            ${{ env.WORKDIR }}/plan.txt
+            ${{ env.WORKDIR }}/plan.json
+            ${{ env.WORKDIR }}/summary.md
+            ${{ env.WORKDIR }}/.terraform.lock.hcl
+          include-hidden-files: true
+          retention-days: 3
+          if-no-files-found: error
+
+  apply:
+    name: 🚀 ${{ inputs.action }}
+    needs: plan
+    if: inputs.action != 'plan' && needs.plan.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # O environment é o gate do painel: em prod o grafo pausa aqui até a aprovação.
+    environment:
+      name: ${{ inputs.environment }}
+    concurrency:
+      group: tf-apply-${{ inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKDIR }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: AWS credentials (OIDC · apply role)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          role-session-name: gha-apply-${{ inputs.environment }}-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      # Baixa o plan salvo + lock file: garante as mesmas versões de provider.
+      - name: Download plan
+        uses: actions/download-artifact@v8
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ env.WORKDIR }}
+
+      - name: terraform init
+        run: terraform init -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: terraform apply (plan salvo)
+        run: terraform apply -lock-timeout=5m -no-color tfplan
+
+      - name: Outputs summary
+        if: inputs.action == 'apply'
+        run: |
+          {
+            echo "### ✅ Outputs · \`${{ inputs.environment }}\`"
+            echo
+            echo "| Output | Valor |"
+            echo "|---|---|"
+            terraform output -json | jq -r 'to_entries[] | "| \(.key) | `\(.value.value // "—")` |"'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Destroy summary
+        if: inputs.action == 'destroy'
+        run: echo "### 🗑️ Ambiente \`${{ inputs.environment }}\` destruído" >> "$GITHUB_STEP_SUMMARY"

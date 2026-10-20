@@ -1,0 +1,150 @@
+# Workflow reutilizável: quality gate de Terraform.
+# fmt → validate + tflint (matrix) → terraform test (matrix) → checkov (opcional)
+name: _quality
+
+on:
+  workflow_call:
+    inputs:
+      run_checkov:
+        description: Run the checkov security scan
+        type: boolean
+        default: true
+      run_tests:
+        description: Run terraform test on the modules
+        type: boolean
+        default: true
+
+# `shell: bash` ativa -o pipefail (o padrão do runner não ativa).
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.16.6"
+  TFLINT_VERSION: "v0.64.0"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  fmt:
+    name: 🧹 fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+  validate:
+    name: 🔎 validate · ${{ matrix.dir }}
+    needs: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [bootstrap, modules/network, modules/compute, envs/dev, envs/prod]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+          cache: true
+
+      - name: terraform init (sem backend)
+        working-directory: ${{ matrix.dir }}
+        run: terraform init -backend=false
+
+      - name: terraform validate
+        working-directory: ${{ matrix.dir }}
+        run: terraform validate
+
+      - name: tflint
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          tflint --init
+          tflint --chdir="${{ matrix.dir }}" --config="$GITHUB_WORKSPACE/.tflint.hcl" --format=compact
+
+  test:
+    name: 🧪 test · ${{ matrix.module }}
+    needs: fmt
+    if: inputs.run_tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [network, compute]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # Provider mockado: não precisa de credenciais AWS.
+      - name: terraform test
+        working-directory: modules/${{ matrix.module }}
+        run: |
+          terraform init -backend=false
+          terraform test
+
+  checkov:
+    name: 🛡️ checkov
+    needs: fmt
+    if: inputs.run_checkov
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install checkov
+        run: pip install --quiet "checkov==3.3.30"
+
+      - name: checkov scan
+        run: |
+          checkov --config-file .checkov.yaml \
+            --output cli --output sarif --output-file-path console,checkov.sarif \
+            | tee checkov.txt
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### 🛡️ Checkov"
+            echo '```'
+            grep -E "^(Passed|Failed|Skipped) checks|^terraform scan results" checkov.txt || echo "sem resultados"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SARIF (aba Security)
+        if: always() && hashFiles('checkov.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+        continue-on-error: true
