@@ -1,0 +1,7 @@
+# Copie para terraform.tfvars (ignorado pelo Git) e ajuste.
+aws_region           = "us-east-1"
+github_owner         = "LucasCA-Git"
+github_repository    = "tf-painel"
+monthly_budget_usd   = 20
+budget_alert_emails  = ["seu-email@exemplo.com"]
+create_oidc_provider = true
