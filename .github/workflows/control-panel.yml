@@ -1,0 +1,109 @@
+# 🎛️ Painel de controle: execução manual com checkboxes.
+# Actions → "Control Panel" → Run workflow.
+name: Control Panel
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "🌎 Ambiente"
+        type: choice
+        options: [dev, prod]
+        default: dev
+      action:
+        description: "⚙️ Ação"
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+      run_quality:
+        description: "✅ Rodar quality gate (fmt, validate, tflint, test)"
+        type: boolean
+        default: true
+      run_checkov:
+        description: "🛡️ Rodar checkov"
+        type: boolean
+        default: true
+      confirm_destroy:
+        description: "🗑️ Para destroy, digite: destroy-<ambiente>"
+        type: string
+        default: ""
+
+run-name: "🎛️ ${{ inputs.action }} · ${{ inputs.environment }} · por @${{ github.actor }}"
+
+# `shell: bash` ativa -o pipefail (o padrão do runner não ativa).
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+concurrency:
+  group: panel-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: 🔐 guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check prerequisites
+        run: |
+          if [[ -z "${{ vars.TF_STATE_BUCKET }}" ]]; then
+            echo "::error::Bootstrap pendente: configure as variáveis do repositório (veja o README)."
+            exit 1
+          fi
+
+      - name: Confirm destroy
+        if: inputs.action == 'destroy'
+        env:
+          CONFIRM: ${{ inputs.confirm_destroy }}
+          EXPECTED: destroy-${{ inputs.environment }}
+        run: |
+          if [[ "$CONFIRM" != "$EXPECTED" ]]; then
+            echo "::error::Confirmação inválida. Digite exatamente: $EXPECTED"
+            exit 1
+          fi
+
+      - name: Panel summary
+        run: |
+          on() { [[ "$1" == "true" ]] && echo "🟢 on" || echo "⚪ off"; }
+          {
+            echo "## 🎛️ Control Panel"
+            echo
+            echo "| Controle | Valor |"
+            echo "|---|---|"
+            echo "| Ambiente | \`${{ inputs.environment }}\` |"
+            echo "| Ação | \`${{ inputs.action }}\` |"
+            echo "| Quality gate | $(on "${{ inputs.run_quality }}") |"
+            echo "| Checkov | $(on "${{ inputs.run_checkov }}") |"
+            echo "| Aprovação manual | $([[ "${{ inputs.environment }}" == "prod" ]] && echo "🔒 exigida" || echo "—") |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  quality:
+    name: ✅ quality
+    needs: guard
+    if: inputs.run_quality
+    uses: ./.github/workflows/_quality.yml
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      run_checkov: ${{ inputs.run_checkov }}
+
+  terraform:
+    name: 🏗️ ${{ inputs.environment }}
+    needs: [guard, quality]
+    # Roda se o guard passou e o quality passou OU foi desligado no painel.
+    if: >-
+      always() &&
+      needs.guard.result == 'success' &&
+      (needs.quality.result == 'success' || needs.quality.result == 'skipped')
+    uses: ./.github/workflows/_terraform.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      environment: ${{ inputs.environment }}
+      action: ${{ inputs.action }}
