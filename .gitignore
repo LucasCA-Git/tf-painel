@@ -1,0 +1,32 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfplan
+tfplan
+plan.json
+plan.txt
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Variáveis locais (podem conter e-mail/dados pessoais) — exceto as dos ambientes
+bootstrap/terraform.tfvars
+*.auto.tfvars
+
+# Ferramentas
+.infracost/
+checkov.sarif
+node_modules/
+
+# SO / editores
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

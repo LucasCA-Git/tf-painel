@@ -1,0 +1,4 @@
+# Normaliza finais de linha (o repo é editado no Windows e roda no Linux).
+* text=auto eol=lf
+*.sh text eol=lf
+*.tftpl text eol=lf

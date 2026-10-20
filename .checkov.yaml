@@ -1,0 +1,17 @@
+# Configuração do checkov (local e CI). Skips pontuais ficam inline no código,
+# sempre com justificativa (#checkov:skip=ID:motivo).
+directory:
+  - .
+framework:
+  - terraform
+  - github_actions
+skip-path:
+  - .terraform
+  - tests
+compact: true
+skip-download: true
+skip-check:
+  # O painel é, por definição, um workflow_dispatch com inputs (ADR-0004).
+  - CKV_GHA_7
+quiet: true
+download-external-modules: false
