@@ -1,0 +1,22 @@
+#!/bin/bash
+# Bootstrap da instância: nginx servindo uma página de status e /health.
+set -euo pipefail
+
+dnf install -y nginx
+
+cat > /usr/share/nginx/html/index.html <<'HTML'
+<!doctype html>
+<html lang="pt-BR">
+<head><meta charset="utf-8"><title>tf-painel · ${environment}</title></head>
+<body style="font-family:system-ui;margin:3rem">
+  <h1>tf-painel</h1>
+  <p>Ambiente: <strong>${environment}</strong></p>
+  <p>Versão: <code>${app_version}</code></p>
+  <p>Provisionado por Terraform via GitHub Actions.</p>
+</body>
+</html>
+HTML
+
+echo "ok" > /usr/share/nginx/html/health
+
+systemctl enable --now nginx
