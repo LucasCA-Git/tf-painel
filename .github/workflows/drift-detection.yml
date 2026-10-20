@@ -1,0 +1,81 @@
+# Drift detection: compara a infra real com o código e abre uma issue se divergir.
+name: Drift Detection
+
+on:
+  schedule:
+    - cron: "0 11 * * *" # 08:00 em Fortaleza (UTC-3)
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "🌎 Ambiente"
+        type: choice
+        options: [prod, dev]
+        default: prod
+
+# `shell: bash` ativa -o pipefail (o padrão do runner não ativa).
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: 🔍 drift · ${{ inputs.environment || 'prod' }}
+    if: vars.ENABLE_DRIFT_DETECTION == 'true' && vars.TF_STATE_BUCKET != ''
+    uses: ./.github/workflows/_terraform.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      environment: ${{ inputs.environment || 'prod' }}
+      action: plan
+
+  report:
+    name: 📣 issue
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open, update or close the drift issue
+        uses: actions/github-script@v9
+        env:
+          ENV_NAME: ${{ inputs.environment || 'prod' }}
+          HAS_CHANGES: ${{ needs.plan.outputs.has_changes }}
+          SUMMARY: ${{ needs.plan.outputs.summary }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const env = process.env.ENV_NAME;
+            const drifted = process.env.HAS_CHANGES === 'true';
+            const title = `🌪️ Drift detectado em ${env}`;
+            const run = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: 'drift', per_page: 100,
+            });
+            const issue = open.find((i) => i.title === title);
+
+            if (drifted) {
+              const body = [
+                `A infraestrutura de \`${env}\` diverge do código: **${process.env.SUMMARY}**.`,
+                '',
+                `Plan completo: ${run}`,
+                '',
+                'Para reconciliar: rode o **Control Panel** com `apply`, ou corrija o código via PR.',
+              ].join('\n');
+              if (issue) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body });
+              } else {
+                await github.rest.issues.create({ owner, repo, title, body, labels: ['drift'] });
+              }
+              core.warning(`Drift em ${env}: ${process.env.SUMMARY}`);
+            } else if (issue) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: issue.number, body: `✅ Sem drift em ${run}. Fechando.`,
+              });
+              await github.rest.issues.update({ owner, repo, issue_number: issue.number, state: 'closed' });
+            }

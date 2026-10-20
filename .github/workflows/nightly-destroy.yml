@@ -1,0 +1,32 @@
+# Destroy noturno do dev: laboratório não precisa ficar ligado de madrugada (ADR-0003).
+name: Nightly Destroy (dev)
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # 23:00 em Fortaleza (UTC-3)
+  workflow_dispatch:
+
+# `shell: bash` ativa -o pipefail (o padrão do runner não ativa).
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+concurrency:
+  group: panel-dev
+  cancel-in-progress: false
+
+jobs:
+  destroy:
+    name: 🌙 destroy · dev
+    # Ligado por padrão; desligue com a variável ENABLE_NIGHTLY_DESTROY=false.
+    if: vars.ENABLE_NIGHTLY_DESTROY != 'false' && vars.TF_STATE_BUCKET != ''
+    uses: ./.github/workflows/_terraform.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      environment: dev
+      action: destroy
