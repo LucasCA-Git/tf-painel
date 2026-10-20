@@ -1,0 +1,59 @@
+# Entrega contínua: merge na main → dev → (aprovação) → prod.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "modules/**"
+      - "envs/**"
+      - ".github/workflows/_quality.yml"
+      - ".github/workflows/_terraform.yml"
+      - ".github/workflows/deploy.yml"
+      - ".github/scripts/**"
+
+# `shell: bash` ativa -o pipefail (o padrão do runner não ativa).
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+# Um deploy por vez; nunca cancela um apply em andamento.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    name: ✅ quality
+    uses: ./.github/workflows/_quality.yml
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      run_checkov: ${{ vars.ENABLE_CHECKOV != 'false' }}
+
+  dev:
+    name: 🧪 dev
+    needs: quality
+    if: vars.TF_STATE_BUCKET != ''
+    uses: ./.github/workflows/_terraform.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      environment: dev
+      action: apply
+
+  prod:
+    name: 🏭 prod
+    needs: dev
+    uses: ./.github/workflows/_terraform.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      environment: prod
+      action: apply
