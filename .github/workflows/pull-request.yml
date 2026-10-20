@@ -1,0 +1,146 @@
+# Pipeline de Pull Request: o "painel" de revisão.
+# commitlint ─┐
+# quality ────┼─> plan (dev, prod) ─> infracost ─> comentário no PR
+name: Pull Request
+
+on:
+  pull_request:
+    branches: [main]
+
+# `shell: bash` ativa -o pipefail (o padrão do runner não ativa).
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  commitlint:
+    name: 📝 commitlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Install commitlint
+        run: npm install --no-save --no-audit --no-fund @commitlint/cli@21 @commitlint/config-conventional@21
+
+      - name: Lint commits do PR
+        run: npx commitlint --from "${{ github.event.pull_request.base.sha }}" --to "${{ github.event.pull_request.head.sha }}" --verbose
+
+      # Com squash merge, o título do PR vira o commit na main.
+      - name: Lint título do PR
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: echo "$PR_TITLE" | npx commitlint --verbose
+
+  quality:
+    name: ✅ quality
+    uses: ./.github/workflows/_quality.yml
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      run_checkov: ${{ vars.ENABLE_CHECKOV != 'false' }}
+
+  plan:
+    name: 📋 plan · ${{ matrix.environment }}
+    needs: quality
+    # PRs de fork não recebem token OIDC; sem bootstrap não há AWS para planejar.
+    if: github.event.pull_request.head.repo.full_name == github.repository && vars.TF_STATE_BUCKET != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, prod]
+    uses: ./.github/workflows/_terraform.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      environment: ${{ matrix.environment }}
+      action: plan
+
+  infracost:
+    name: 💰 infracost
+    needs: plan
+    if: vars.ENABLE_INFRACOST == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: tfplan-*
+          path: plans
+
+      - uses: infracost/actions/setup@v5
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: infracost breakdown
+        run: |
+          for env in dev prod; do
+            infracost breakdown --path "plans/tfplan-${env}/plan.json" \
+              --project-name "tf-painel-${env}" --format json --out-file "infracost-${env}.json"
+          done
+          infracost output --path "infracost-*.json" --format github-comment --out-file infracost.md
+          cat infracost.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: infracost
+          path: infracost.md
+          retention-days: 3
+
+  comment:
+    name: 💬 comentário
+    needs: [plan, infracost]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Upsert PR comment
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const read = (p) => (fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '');
+            const marker = '<!-- tf-painel:plan -->';
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const body = [
+              marker,
+              '## 🎛️ tf-painel · resultado do pipeline',
+              read('artifacts/tfplan-dev/summary.md'),
+              read('artifacts/tfplan-prod/summary.md'),
+              read('artifacts/infracost/infracost.md'),
+              `<sub>Commit \`${context.payload.pull_request.head.sha.slice(0, 7)}\` · [ver execução](${run})</sub>`,
+            ].filter(Boolean).join('\n\n');
+
+            // Atualiza o comentário existente em vez de poluir o PR.
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find((c) => c.body?.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
